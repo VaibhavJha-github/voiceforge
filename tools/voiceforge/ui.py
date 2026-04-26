@@ -86,12 +86,13 @@ def _get_voice_profiles() -> dict[str, VoiceProfile]:
     meta = _load_voices_meta()
     profiles = {}
     for name, info in meta.items():
-        audio_path = info.get("audio_path", "")
-        if os.path.exists(audio_path):
+        # Use reference_id based loading (supports multiple samples)
+        ref_dir = VOICES_DIR / name.lower()
+        if ref_dir.exists():
             profiles[name.upper()] = VoiceProfile(
                 name=name,
-                reference_audio_path=audio_path,
-                reference_text=info.get("reference_text", ""),
+                reference_audio_path=str(ref_dir),  # directory path
+                reference_text="",  # not needed for ref_id mode
             )
     return profiles
 
@@ -108,14 +109,19 @@ def build_voiceforge_app(
         reference_audio_path: str,
         reference_text: str,
     ) -> np.ndarray:
-        """Single TTS call wrapping the Fish-Speech inference engine."""
-        with open(reference_audio_path, "rb") as f:
-            audio_bytes = f.read()
+        """
+        Single TTS call wrapping the Fish-Speech inference engine.
+        Uses reference_id (folder-based) to support multiple samples per voice.
+        """
+        # reference_audio_path is the voice's folder name under references/
+        # e.g. "references/peter" -> reference_id = "peter"
+        ref_dir = Path(reference_audio_path)
+        ref_id = ref_dir.name  # e.g. "peter"
 
         req = ServeTTSRequest(
             text=text,
-            references=[ServeReferenceAudio(audio=audio_bytes, text=reference_text)],
-            reference_id=None,
+            references=[],
+            reference_id=ref_id,
             max_new_tokens=1024,
             chunk_length=300,
             top_p=0.8,
@@ -136,7 +142,7 @@ def build_voiceforge_app(
     # ── Voice Setup Tab ──────────────────────────────────────────────
 
     def clone_voice(name, audio_file, ref_text):
-        """Clone a new voice from reference audio."""
+        """Clone a new voice from reference audio. Supports multiple samples per voice."""
         if not name or not name.strip():
             return "Error: Please enter a voice name.", _format_voices_list()
         if not audio_file:
@@ -151,23 +157,34 @@ def build_voiceforge_app(
         voice_dir = VOICES_DIR / name.lower()
         voice_dir.mkdir(parents=True, exist_ok=True)
 
-        # Copy audio file
-        dest_audio = voice_dir / "reference.wav"
+        # Count existing samples to auto-number
+        existing = list(voice_dir.glob("sample_*.wav")) + list(voice_dir.glob("sample_*.mp3")) + list(voice_dir.glob("sample_*.flac"))
+        sample_num = len(existing) + 1
+
+        # Copy audio file with numbered name
+        ext = Path(audio_file).suffix or ".wav"
+        dest_audio = voice_dir / f"sample_{sample_num:02d}{ext}"
         shutil.copy2(audio_file, str(dest_audio))
 
-        # Save reference text
-        (voice_dir / "reference.txt").write_text(ref_text.strip())
+        # Save reference text as .lab file (Fish-Speech convention)
+        lab_file = dest_audio.with_suffix(".lab")
+        lab_file.write_text(ref_text.strip())
 
         # Update metadata
         meta = _load_voices_meta()
-        meta[name] = {
+        if name not in meta:
+            meta[name] = {"samples": []}
+        if "samples" not in meta[name]:
+            meta[name]["samples"] = []
+        meta[name]["samples"].append({
             "audio_path": str(dest_audio),
             "reference_text": ref_text.strip(),
-        }
+        })
         _save_voices_meta(meta)
 
-        logger.info(f"Voice cloned: {name}")
-        return f"Voice '{name}' cloned successfully!", _format_voices_list()
+        logger.info(f"Voice '{name}' — added sample {sample_num}")
+        action = "cloned" if sample_num == 1 else f"added sample #{sample_num} to"
+        return f"Voice '{name}' {action} successfully! ({sample_num} sample(s) total)", _format_voices_list()
 
     def delete_voice(name):
         """Delete a cloned voice."""
@@ -192,8 +209,14 @@ def build_voiceforge_app(
             return "No voices cloned yet. Upload reference audio to get started."
         lines = ["**Cloned Voices:**\n"]
         for name, info in sorted(meta.items()):
-            ref_text = info.get("reference_text", "")[:60]
-            lines.append(f"- **{name}** — ref: \"{ref_text}...\"")
+            samples = info.get("samples", [])
+            count = len(samples)
+            previews = []
+            for s in samples[:3]:
+                t = s.get("reference_text", "")[:40]
+                previews.append(f'"{t}..."')
+            sample_info = ", ".join(previews)
+            lines.append(f"- **{name}** — {count} sample(s): {sample_info}")
         return "\n".join(lines)
 
     def preview_voice(name, preview_text):
@@ -203,17 +226,15 @@ def build_voiceforge_app(
         if not preview_text or not preview_text.strip():
             return None, "Enter some text to preview."
 
-        profiles = _get_voice_profiles()
-        key = name.upper()
-        if key not in profiles:
+        voice_dir = VOICES_DIR / name.lower()
+        if not voice_dir.exists():
             return None, f"Voice '{name}' not found."
 
-        profile = profiles[key]
         try:
             audio = tts_inference(
                 text=preview_text.strip(),
-                reference_audio_path=profile.reference_audio_path,
-                reference_text=profile.reference_text,
+                reference_audio_path=str(voice_dir),
+                reference_text="",
             )
             return (sample_rate, audio), None
         except Exception as e:
